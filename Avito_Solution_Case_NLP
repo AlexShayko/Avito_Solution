@@ -1,0 +1,1826 @@
+{
+  "metadata": {
+    "kernelspec": {
+      "language": "python",
+      "display_name": "Python 3",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python",
+      "version": "3.12.13",
+      "mimetype": "text/x-python",
+      "codemirror_mode": {
+        "name": "ipython",
+        "version": 3
+      },
+      "pygments_lexer": "ipython3",
+      "nbconvert_exporter": "python",
+      "file_extension": ".py"
+    },
+    "kaggle": {
+      "accelerator": "none",
+      "dataSources": [],
+      "dockerImageVersionId": 28755,
+      "isInternetEnabled": false,
+      "language": "python",
+      "sourceType": "notebook",
+      "isGpuEnabled": false
+    },
+    "colab": {
+      "provenance": []
+    }
+  },
+  "nbformat_minor": 0,
+  "nbformat": 4,
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-0"
+      },
+      "source": [
+        "# Поиск объявлений услуг Авито\n",
+        "\n",
+        "Нужно найти до 50 объявлений для каждого запроса. Сначала попробуем поиск по тексту, потом добавим CatBoost и проверим, помогает ли их смесь. Качество сравниваем по Recall@50: какую долю выбранных пользователями объявлений удалось вернуть, в среднем по запросам.\n",
+        "\n",
+        "### 1. Подготовка\n",
+        "\n",
+        "Подключаем библиотеки, указываем пути к трём файлам и папку для результатов. SEED фиксируем, чтобы при повторном запуске выбирать те же запросы для проверки и обучения.\n",
+        "\n",
+        "Для запуска нужны pandas, NumPy, scikit-learn, CatBoost, tqdm и движок для Parquet, например pyarrow. Используем открытые библиотеки, TF-IDF и смешивание списков по местам объявлений. Запросов к внешним API в решении нет. Ячейки запускаем сверху вниз; для обучения CatBoost в этом коде нужна NVIDIA GPU, а пути к данным при запуске у себя нужно заменить."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "from pathlib import Path\n",
+        "import time\n",
+        "\n",
+        "import numpy as np\n",
+        "import pandas as pd\n",
+        "from IPython.display import display\n",
+        "\n",
+        "TRAIN_PATH = Path(\"/kaggle/input/datasets/shaykoaleksandr/dataset-files/train.parquet\")\n",
+        "QUERIES_PATH = Path(\"/kaggle/input/datasets/shaykoaleksandr/dataset-files/benchmark_queries.parquet\")\n",
+        "ITEMS_PATH = Path(\"/kaggle/input/datasets/shaykoaleksandr/dataset-files/benchmark_items.parquet\")\n",
+        "\n",
+        "# Тут сохранятся результаты\n",
+        "OUTPUT_DIR = Path(\"/kaggle/working\")\n",
+        "OUTPUT_DIR.mkdir(parents=True, exist_ok=True)\n",
+        "\n",
+        "SEED = 67\n",
+        "rng = np.random.default_rng(SEED)"
+      ],
+      "metadata": {
+        "_uuid": "8f2839f25d086af736a60e9eeb907d3b93b6e0e5",
+        "_cell_guid": "b1076dfc-b9ad-4769-8c92-a6c4dae69d19",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T17:58:18.948433Z",
+          "iopub.execute_input": "2026-09-28T17:58:18.948745Z",
+          "iopub.status.idle": "2026-09-28T17:58:20.292626Z",
+          "shell.execute_reply.started": "2026-09-28T17:58:18.948688Z",
+          "shell.execute_reply": "2026-09-28T17:58:20.291879Z"
+        },
+        "id": "iTX377yonePc"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-1"
+      },
+      "source": [
+        "### 2. Загрузка данных\n",
+        "\n",
+        "Читаем файлы в три таблицы: train с пользовательскими выборами, queries с запросами для ответа и items с объявлениями, среди которых нужно искать. Заодно выводим размеры, чтобы проверить, что всё загрузилось."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "start = time.time()\n",
+        "\n",
+        "train = pd.read_parquet(TRAIN_PATH)\n",
+        "queries = pd.read_parquet(QUERIES_PATH)\n",
+        "items = pd.read_parquet(ITEMS_PATH)\n",
+        "\n",
+        "for name, df in [\n",
+        "    (\"train\", train),\n",
+        "    (\"queries\", queries),\n",
+        "    (\"items\", items),\n",
+        "]:\n",
+        "    print(\n",
+        "        f\"{name}: {len(df):,} строк, \"\n",
+        "        f\"{df.shape[1]} колонок, \"\n",
+        "    )"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T18:07:16.754024Z",
+          "iopub.execute_input": "2026-09-28T18:07:16.754341Z",
+          "iopub.status.idle": "2026-09-28T18:07:32.416309Z",
+          "shell.execute_reply.started": "2026-09-28T18:07:16.754316Z",
+          "shell.execute_reply": "2026-09-28T18:07:32.415639Z"
+        },
+        "id": "ATTuqvwqnePe",
+        "outputId": "1a0d9354-54fe-4d56-b936-0fa885cccd62"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "train: 497,673 строк, 19 колонок, \nqueries: 2,452 строк, 6 колонок, \nitems: 189,212 строк, 14 колонок, \n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-2"
+      },
+      "source": [
+        "### 3. Пропуски и типы колонок\n",
+        "\n",
+        "Загрузились 497 673 обучающие пары, 2 452 запроса и 189 212 объявлений. Теперь смотрим, где есть пропуски и в каком виде записаны признаки. Это пригодится, когда будем готовить текст и числовые поля."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "for name, df in [\n",
+        "    (\"train\", train),\n",
+        "    (\"queries\", queries),\n",
+        "    (\"items\", items),\n",
+        "]:\n",
+        "    print(f\"\\n{name}\")\n",
+        "\n",
+        "    summary = pd.DataFrame({\n",
+        "        \"dtype\": df.dtypes.astype(str),\n",
+        "        \"missing_count\": df.isna().sum(),\n",
+        "        \"missing_percent\": (100 * df.isna().mean()).round(2),\n",
+        "    })\n",
+        "\n",
+        "    display(summary)"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T18:08:57.496555Z",
+          "iopub.execute_input": "2026-09-28T18:08:57.497250Z",
+          "iopub.status.idle": "2026-09-28T18:08:58.410952Z",
+          "shell.execute_reply.started": "2026-09-28T18:08:57.497217Z",
+          "shell.execute_reply": "2026-09-28T18:08:58.410321Z"
+        },
+        "id": "16WLiBRYnePf",
+        "outputId": "d00facf7-8bc2-428e-98c9-9733e787dec0"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "\ntrain\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "                             dtype  missing_count  missing_percent\nsearch_query                object              0             0.00\nsearch_location_id           int64              0             0.00\nsearch_is_delivery_search    int32              0             0.00\nsearch_infm_params_text     object              0             0.00\nsearch_category              int64              0             0.00\nitem_title_raw              object              0             0.00\nitem_rating_reviews_count  float64          19211             3.86\nitem_rating                float64          28232             5.67\nitem_price                  object              0             0.00\nitem_microcat_id             int64              0             0.00\nitem_longitude              object              4             0.00\nitem_location_id             int64              0             0.00\nitem_latitude               object              4             0.00\nitem_is_phone_hidden          bool              0             0.00\nitem_is_message_forbidden     bool              0             0.00\nitem_infm_params_text       object              0             0.00\nitem_id                     object              0             0.00\nitem_description_raw        object              0             0.00\nitem_category_id             int64              0             0.00",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>dtype</th>\n      <th>missing_count</th>\n      <th>missing_percent</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>search_query</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>search_location_id</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>search_is_delivery_search</th>\n      <td>int32</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>search_infm_params_text</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>search_category</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_title_raw</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_rating_reviews_count</th>\n      <td>float64</td>\n      <td>19211</td>\n      <td>3.86</td>\n    </tr>\n    <tr>\n      <th>item_rating</th>\n      <td>float64</td>\n      <td>28232</td>\n      <td>5.67</td>\n    </tr>\n    <tr>\n      <th>item_price</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_microcat_id</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_longitude</th>\n      <td>object</td>\n      <td>4</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_location_id</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_latitude</th>\n      <td>object</td>\n      <td>4</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_is_phone_hidden</th>\n      <td>bool</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_is_message_forbidden</th>\n      <td>bool</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_infm_params_text</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_id</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_description_raw</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_category_id</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "\nqueries\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "                            dtype  missing_count  missing_percent\nquery_id                   object              0              0.0\nsearch_query               object              0              0.0\nsearch_location_id          int64              0              0.0\nsearch_is_delivery_search   int32              0              0.0\nsearch_infm_params_text    object              0              0.0\nsearch_category             int64              0              0.0",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>dtype</th>\n      <th>missing_count</th>\n      <th>missing_percent</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>query_id</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>search_query</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>search_location_id</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>search_is_delivery_search</th>\n      <td>int32</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>search_infm_params_text</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n    <tr>\n      <th>search_category</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.0</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "\nitems\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "                             dtype  missing_count  missing_percent\nitem_title_raw              object              0             0.00\nitem_rating_reviews_count  float64          11615             6.14\nitem_rating                float64          17631             9.32\nitem_price                  object              0             0.00\nitem_microcat_id             int64              0             0.00\nitem_longitude              object              1             0.00\nitem_location_id             int64              0             0.00\nitem_latitude               object              1             0.00\nitem_is_phone_hidden          bool              0             0.00\nitem_is_message_forbidden     bool              0             0.00\nitem_infm_params_text       object              0             0.00\nitem_id                     object              0             0.00\nitem_description_raw        object             35             0.02\nitem_category_id             int64              0             0.00",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>dtype</th>\n      <th>missing_count</th>\n      <th>missing_percent</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>item_title_raw</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_rating_reviews_count</th>\n      <td>float64</td>\n      <td>11615</td>\n      <td>6.14</td>\n    </tr>\n    <tr>\n      <th>item_rating</th>\n      <td>float64</td>\n      <td>17631</td>\n      <td>9.32</td>\n    </tr>\n    <tr>\n      <th>item_price</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_microcat_id</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_longitude</th>\n      <td>object</td>\n      <td>1</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_location_id</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_latitude</th>\n      <td>object</td>\n      <td>1</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_is_phone_hidden</th>\n      <td>bool</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_is_message_forbidden</th>\n      <td>bool</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_infm_params_text</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_id</th>\n      <td>object</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n    <tr>\n      <th>item_description_raw</th>\n      <td>object</td>\n      <td>35</td>\n      <td>0.02</td>\n    </tr>\n    <tr>\n      <th>item_category_id</th>\n      <td>int64</td>\n      <td>0</td>\n      <td>0.00</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-3"
+      },
+      "source": [
+        "### 4. Какие объявления встречаются в обеих выборках\n",
+        "\n",
+        "В запросах пропусков нет. В объявлениях иногда не хватает рейтинга и числа отзывов, а у 35 объявлений benchmark нет описания. Теперь проверим, сколько объявлений из train вообще есть среди тех, которые разрешено возвращать в ответе."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "corpus_ids = set(items[\"item_id\"])\n",
+        "train_in_corpus = train[\"item_id\"].isin(corpus_ids)\n",
+        "\n",
+        "print(\n",
+        "    \"\\nДоля строк train с объявлением из benchmark_items: \"\n",
+        "    f\"{train_in_corpus.mean():.2%}\"\n",
+        ")\n",
+        "\n",
+        "unique_train_ids = set(train[\"item_id\"].dropna())\n",
+        "print(f\"Уникальных объявлений в train: {len(unique_train_ids):,}\")\n",
+        "print(\n",
+        "    \"Из них есть в benchmark_items: \"\n",
+        "    f\"{len(unique_train_ids & corpus_ids):,}\"\n",
+        ")"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T18:17:37.570969Z",
+          "iopub.execute_input": "2026-09-28T18:17:37.571401Z",
+          "iopub.status.idle": "2026-09-28T18:17:37.937649Z",
+          "shell.execute_reply.started": "2026-09-28T18:17:37.571372Z",
+          "shell.execute_reply": "2026-09-28T18:17:37.936833Z"
+        },
+        "id": "z8-fnV0cnePf",
+        "outputId": "e957a047-5703-4ca8-9cd6-1a1c383a5426"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "\nДоля строк train с объявлением из benchmark_items: 6.63%\nУникальных объявлений в train: 344,825\nИз них есть в benchmark_items: 18,142\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-4"
+      },
+      "source": [
+        "### 5. Повторяющиеся запросы\n",
+        "\n",
+        "В benchmark нашлись 18 142 из 344 825 уникальных объявлений train. На них приходится 6,63% обучающих строк, поэтому одного запоминания выбранных объявлений не хватит.\n",
+        "\n",
+        "Теперь смотрим на запросы. Один текст в разных городах или с разными фильтрами считаем разными комбинациями признаков поиска. Собираем такие комбинации в query_groups и отдельно проверяем совпадения с benchmark по всем признакам и только по тексту."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "search_cols = [\n",
+        "    column for column in queries.columns\n",
+        "    if column.startswith(\"search_\")\n",
+        "]\n",
+        "\n",
+        "print(\"Признаки запроса:\", search_cols)\n",
+        "print(f\"\\nУникальных текстов в train: {train['search_query'].nunique():,}\")\n",
+        "print(f\"Уникальных текстов в benchmark: {queries['search_query'].nunique():,}\")\n",
+        "\n",
+        "# Одна группа — одинаковый набор всех search-признаков.\n",
+        "# dropna=False сохраняет группы с незаполненными фильтрами.\n",
+        "\n",
+        "# Здесь мы формируем группы из запросов. Одна группа - все одинаковые search признаки. Ну и пишем dropna=False, чтобы сохранять\n",
+        "# группы у которых не заполнены фильтры.\n",
+        "query_groups = (\n",
+        "    train.groupby(search_cols, dropna=False, observed=True)\n",
+        "    .agg(\n",
+        "        rows=(\"item_id\", \"size\"),\n",
+        "        relevant_items=(\"item_id\", \"nunique\"),\n",
+        "    )\n",
+        "    .reset_index()\n",
+        ")\n",
+        "\n",
+        "print(f\"Уникальных полных запросов в train: {len(query_groups):,}\")\n",
+        "\n",
+        "print(\"\\nСколько выбранных объявлений приходится на один полный запрос:\")\n",
+        "display(\n",
+        "    query_groups[\"relevant_items\"]\n",
+        "    .describe(percentiles=[0.5, 0.9, 0.95, 0.99])\n",
+        "    .to_frame()\n",
+        ")\n",
+        "\n",
+        "# Здесь мы проверяем, что у нас полностью совпадают запросы по признакам из трейна и из бенчмарка\n",
+        "unique_train_queries = train[search_cols].drop_duplicates()\n",
+        "\n",
+        "query_overlap = queries[search_cols].merge(\n",
+        "    unique_train_queries,\n",
+        "    on=search_cols,\n",
+        "    how=\"left\",\n",
+        "    indicator=True,\n",
+        "    validate=\"many_to_one\",\n",
+        ")\n",
+        "\n",
+        "print(\n",
+        "    \"\\nДоля benchmark-запросов, полностью совпадающих с запросами train: \"\n",
+        "    f\"{query_overlap['_merge'].eq('both').mean():.2%}\"\n",
+        ")\n",
+        "\n",
+        "print(\n",
+        "    \"Доля benchmark-запросов с текстом, встречавшимся в train: \"\n",
+        "    f\"{queries['search_query'].isin(train['search_query']).mean():.2%}\"\n",
+        ")"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T18:25:54.012188Z",
+          "iopub.execute_input": "2026-09-28T18:25:54.012637Z",
+          "iopub.status.idle": "2026-09-28T18:25:55.105441Z",
+          "shell.execute_reply.started": "2026-09-28T18:25:54.012608Z",
+          "shell.execute_reply": "2026-09-28T18:25:55.104704Z"
+        },
+        "id": "nK245GVcnePg",
+        "outputId": "c9204d7a-3a6d-404a-ee3f-3dc1e354d6da"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Признаки запроса: ['search_query', 'search_location_id', 'search_is_delivery_search', 'search_infm_params_text', 'search_category']\n\nУникальных текстов в train: 74,529\nУникальных текстов в benchmark: 2,452\nУникальных полных запросов в train: 354,463\n\nСколько выбранных объявлений приходится на один полный запрос:\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "       relevant_items\ncount   354463.000000\nmean         1.317638\nstd          1.611180\nmin          1.000000\n50%          1.000000\n90%          2.000000\n95%          3.000000\n99%          6.000000\nmax        278.000000",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>relevant_items</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>count</th>\n      <td>354463.000000</td>\n    </tr>\n    <tr>\n      <th>mean</th>\n      <td>1.317638</td>\n    </tr>\n    <tr>\n      <th>std</th>\n      <td>1.611180</td>\n    </tr>\n    <tr>\n      <th>min</th>\n      <td>1.000000</td>\n    </tr>\n    <tr>\n      <th>50%</th>\n      <td>1.000000</td>\n    </tr>\n    <tr>\n      <th>90%</th>\n      <td>2.000000</td>\n    </tr>\n    <tr>\n      <th>95%</th>\n      <td>3.000000</td>\n    </tr>\n    <tr>\n      <th>99%</th>\n      <td>6.000000</td>\n    </tr>\n    <tr>\n      <th>max</th>\n      <td>278.000000</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "\nДоля benchmark-запросов, полностью совпадающих с запросами train: 4.40%\nДоля benchmark-запросов с текстом, встречавшимся в train: 36.99%\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-5"
+      },
+      "source": [
+        "### 6. Примеры запросов и объявлений\n",
+        "\n",
+        "Около 37% текстов benchmark уже встречались в train, но по всем признакам поиска совпадает только 4,4% запросов. Посмотрим несколько реальных примеров и частые категории, чтобы понять, что именно записано в текстах и параметрах."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "with pd.option_context(\"display.max_colwidth\", 220):\n",
+        "    print(\"Примеры запросов benchmark:\")\n",
+        "    display(queries.sample(min(5, len(queries)), random_state=SEED))\n",
+        "\n",
+        "    print(\"\\nПримеры положительных пар из train:\")\n",
+        "    example_cols = search_cols + [\n",
+        "        column for column in [\n",
+        "            \"item_id\",\n",
+        "            \"item_title_raw\",\n",
+        "            \"item_description_raw\",\n",
+        "            \"item_infm_params_text\",\n",
+        "            \"item_category_id\",\n",
+        "            \"item_location_id\",\n",
+        "        ]\n",
+        "        if column in train.columns\n",
+        "    ]\n",
+        "\n",
+        "    display(\n",
+        "        train[example_cols].sample(\n",
+        "            min(5, len(train)),\n",
+        "            random_state=SEED,\n",
+        "        )\n",
+        "    )\n",
+        "\n",
+        "print(\"\\nКатегории запросов в train:\")\n",
+        "display(train[\"search_category\"].value_counts(dropna=False).head(15))\n",
+        "\n",
+        "print(\"\\nКатегории объявлений в корпусе:\")\n",
+        "display(items[\"item_category_id\"].value_counts(dropna=False).head(15))"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T18:28:24.871366Z",
+          "iopub.execute_input": "2026-09-28T18:28:24.871835Z",
+          "iopub.status.idle": "2026-09-28T18:28:25.016095Z",
+          "shell.execute_reply.started": "2026-09-28T18:28:24.871807Z",
+          "shell.execute_reply": "2026-09-28T18:28:25.015463Z"
+        },
+        "id": "_oImGMNBnePg",
+        "outputId": "259cbefe-1986-421d-f3af-6d61a27a4957"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Примеры запросов benchmark:\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "              query_id                   search_query  search_location_id  \\\n1412  kNwxx7DHbGAJHsLi  вывоз старой мебели на свалку              639440   \n316   2KzUhe61bPyE1wuH       утепление крыши минватой              635860   \n1017  vVsNRyPU9Jus2tEX       бригада по ремонту домов              628780   \n1353  N9mTnUXVm03Yoijm               перевозка мебели              656901   \n476   YVhrad8cmxvFxAji                    сахьянова 5              653271   \n\n      search_is_delivery_search  \\\n1412                          0   \n316                           0   \n1017                          0   \n1353                          0   \n476                           0   \n\n                                     search_infm_params_text  search_category  \n1412                     Вид услуги Вывоз мусора и вторсырья              114  \n316                                                                       114  \n1017                                                                        0  \n1353                               Вид услуги Грузоперевозки              114  \n476   Тип услуги Ресницы, брови Вид услуги Красота, здоровье              114  ",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>query_id</th>\n      <th>search_query</th>\n      <th>search_location_id</th>\n      <th>search_is_delivery_search</th>\n      <th>search_infm_params_text</th>\n      <th>search_category</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>1412</th>\n      <td>kNwxx7DHbGAJHsLi</td>\n      <td>вывоз старой мебели на свалку</td>\n      <td>639440</td>\n      <td>0</td>\n      <td>Вид услуги Вывоз мусора и вторсырья</td>\n      <td>114</td>\n    </tr>\n    <tr>\n      <th>316</th>\n      <td>2KzUhe61bPyE1wuH</td>\n      <td>утепление крыши минватой</td>\n      <td>635860</td>\n      <td>0</td>\n      <td></td>\n      <td>114</td>\n    </tr>\n    <tr>\n      <th>1017</th>\n      <td>vVsNRyPU9Jus2tEX</td>\n      <td>бригада по ремонту домов</td>\n      <td>628780</td>\n      <td>0</td>\n      <td></td>\n      <td>0</td>\n    </tr>\n    <tr>\n      <th>1353</th>\n      <td>N9mTnUXVm03Yoijm</td>\n      <td>перевозка мебели</td>\n      <td>656901</td>\n      <td>0</td>\n      <td>Вид услуги Грузоперевозки</td>\n      <td>114</td>\n    </tr>\n    <tr>\n      <th>476</th>\n      <td>YVhrad8cmxvFxAji</td>\n      <td>сахьянова 5</td>\n      <td>653271</td>\n      <td>0</td>\n      <td>Тип услуги Ресницы, брови Вид услуги Красота, здоровье</td>\n      <td>114</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "\nПримеры положительных пар из train:\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "                       search_query  search_location_id  \\\n120327  компрессор воздушный аренда              662760   \n64519          регулировка клапанов              635320   \n8487                   автоэлектрик              637640   \n464898             гостиничные чеки              637640   \n213389                 автоэлектрик              624360   \n\n        search_is_delivery_search  \\\n120327                          0   \n64519                           0   \n8487                            0   \n464898                          0   \n213389                          0   \n\n                                                                                     search_infm_params_text  \\\n120327                                                                 Вид услуги Оборудование, производство   \n64519                                                                          Вид услуги Автосервис, аренда   \n8487    Тип услуги автосервиса Диагностика и ремонт авто Вид услуги Автосервис, аренда Тип услуги Автосервис   \n464898                                                                                                         \n213389  Тип услуги автосервиса Диагностика и ремонт авто Вид услуги Автосервис, аренда Тип услуги Автосервис   \n\n        search_category           item_id  \\\n120327              114  af5b912f8d36ac13   \n64519               114  1d5b4f2f4ea59055   \n8487                114  f279d884761ff3f9   \n464898              114  5d2620ea37a52b7d   \n213389              114  1766935d306ef247   \n\n                                            item_title_raw  \\\n120327                  Аренда бензо- и электроинструмента   \n64519   Ремонт мототехники, эндуро, снегоходы, квадроциклы   \n8487          Автоэлектрик GM (Opel, Chevrolet, Cadillac )   \n464898   Отчетные документы для командировки и подбор квар   \n213389     Выездной автоэлектрик. Компьютерная диагностика   \n\n                                                                                                                                                                                                               item_description_raw  \\\n120327                                                                                                                                                                     Аренда бензо- и электроинструмента почасовая/посуточная.   \n64519   Cпециaлизиpуемся нa peмонте, сбоpке, тeхничeском oбслуживании  и подборке эндуpо/кpoccoвых мотоциклoв, дoрожных мотоциклoв, квадроциклов и снегоходов.\\r\\nPаботaем c тexникoй из Китaя, Японии, Aвстрии.\\n\\nУcлуги:\\r\\n•...   \n8487    Диагностика и ремонт электрооборудования автомобилей марки GM (Opel, Chevrolet , Cadillac). Большой опыт работы , с 2012 по настоящее время работаю в должности диагноста в дилерском центре GM. Гарантия  качества, отв...   \n464898  Oтпpaвьте нам cообщение 📩 с подpобнoстями вaшeго запpoса нa кpaткocрочную аpeнду квaртиры, гoстиницы или жилья для комaндировoк в Mocквe 🏙.\\n\\nПри необхoдимости мы гoтовы предоcтавить слeдующие oтчeтныe комaндиpовочн...   \n213389  Выезжаю по городу и области. Без выходных.\\n\\nЧто сделаю:\\n\\n✔ Компьютерная диагностика любой системы\\n\\n✔ Поиск скрытых неисправностей\\n\\n✔ Устранение проблем на месте\\n\\n✔ Гарантия на работы\\n\\nЛюбые марки авто. \\n...   \n\n                                                                                                                                                                                                              item_infm_params_text  \\\n120327  Вид услуги Оборудование, производство Тип услуги Аренда оборудования Место оказания услуг Ярославская область, Рыбинск, Заволжский планировочный район, район Заволжье-1 Тип стоимости за услугу Начальная цена График р...   \n64519   Вид услуги Автосервис, аренда Тип услуги Автосервис Место оказания услуг Красноярск, улица Калинина Гарантия Опыт работы 11 Дополнительно Тёплый бокс Тип стоимости за услугу Начальная цена Время для связи от 39600 Вр...   \n8487    Вид услуги Автосервис, аренда Тип услуги Автосервис Место оказания услуг Москва, Кавказский бульвар, 54с5 Гарантия Опыт работы 10 Дополнительно Тёплый бокс Ремонт двигателя Диагностика двигателя Ремонт двигателя Заме...   \n464898  Вид услуги Деловые услуги Тип услуги Бухгалтерия, финансы Место оказания услуг Москва, проезд Воскресенские Ворота Тип стоимости за услугу Начальная цена Опыт работы 10 лет и больше Берёте ли срочные заказы Как вы ра...   \n213389  Вид услуги Автосервис, аренда Тип услуги Автосервис Место оказания услуг Тракторная ул., 11 Гарантия Опыт работы 1 Тип стоимости за услугу Начальная цена Время для связи от 27000 Время для связи до 77400 Время для св...   \n\n        item_category_id  item_location_id  \n120327               114            662760  \n64519                114            635320  \n8487                 114            637640  \n464898               114            637640  \n213389               114            624360  ",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>search_query</th>\n      <th>search_location_id</th>\n      <th>search_is_delivery_search</th>\n      <th>search_infm_params_text</th>\n      <th>search_category</th>\n      <th>item_id</th>\n      <th>item_title_raw</th>\n      <th>item_description_raw</th>\n      <th>item_infm_params_text</th>\n      <th>item_category_id</th>\n      <th>item_location_id</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>120327</th>\n      <td>компрессор воздушный аренда</td>\n      <td>662760</td>\n      <td>0</td>\n      <td>Вид услуги Оборудование, производство</td>\n      <td>114</td>\n      <td>af5b912f8d36ac13</td>\n      <td>Аренда бензо- и электроинструмента</td>\n      <td>Аренда бензо- и электроинструмента почасовая/посуточная.</td>\n      <td>Вид услуги Оборудование, производство Тип услуги Аренда оборудования Место оказания услуг Ярославская область, Рыбинск, Заволжский планировочный район, район Заволжье-1 Тип стоимости за услугу Начальная цена График р...</td>\n      <td>114</td>\n      <td>662760</td>\n    </tr>\n    <tr>\n      <th>64519</th>\n      <td>регулировка клапанов</td>\n      <td>635320</td>\n      <td>0</td>\n      <td>Вид услуги Автосервис, аренда</td>\n      <td>114</td>\n      <td>1d5b4f2f4ea59055</td>\n      <td>Ремонт мототехники, эндуро, снегоходы, квадроциклы</td>\n      <td>Cпециaлизиpуемся нa peмонте, сбоpке, тeхничeском oбслуживании  и подборке эндуpо/кpoccoвых мотоциклoв, дoрожных мотоциклoв, квадроциклов и снегоходов.\\r\\nPаботaем c тexникoй из Китaя, Японии, Aвстрии.\\n\\nУcлуги:\\r\\n•...</td>\n      <td>Вид услуги Автосервис, аренда Тип услуги Автосервис Место оказания услуг Красноярск, улица Калинина Гарантия Опыт работы 11 Дополнительно Тёплый бокс Тип стоимости за услугу Начальная цена Время для связи от 39600 Вр...</td>\n      <td>114</td>\n      <td>635320</td>\n    </tr>\n    <tr>\n      <th>8487</th>\n      <td>автоэлектрик</td>\n      <td>637640</td>\n      <td>0</td>\n      <td>Тип услуги автосервиса Диагностика и ремонт авто Вид услуги Автосервис, аренда Тип услуги Автосервис</td>\n      <td>114</td>\n      <td>f279d884761ff3f9</td>\n      <td>Автоэлектрик GM (Opel, Chevrolet, Cadillac )</td>\n      <td>Диагностика и ремонт электрооборудования автомобилей марки GM (Opel, Chevrolet , Cadillac). Большой опыт работы , с 2012 по настоящее время работаю в должности диагноста в дилерском центре GM. Гарантия  качества, отв...</td>\n      <td>Вид услуги Автосервис, аренда Тип услуги Автосервис Место оказания услуг Москва, Кавказский бульвар, 54с5 Гарантия Опыт работы 10 Дополнительно Тёплый бокс Ремонт двигателя Диагностика двигателя Ремонт двигателя Заме...</td>\n      <td>114</td>\n      <td>637640</td>\n    </tr>\n    <tr>\n      <th>464898</th>\n      <td>гостиничные чеки</td>\n      <td>637640</td>\n      <td>0</td>\n      <td></td>\n      <td>114</td>\n      <td>5d2620ea37a52b7d</td>\n      <td>Отчетные документы для командировки и подбор квар</td>\n      <td>Oтпpaвьте нам cообщение 📩 с подpобнoстями вaшeго запpoса нa кpaткocрочную аpeнду квaртиры, гoстиницы или жилья для комaндировoк в Mocквe 🏙.\\n\\nПри необхoдимости мы гoтовы предоcтавить слeдующие oтчeтныe комaндиpовочн...</td>\n      <td>Вид услуги Деловые услуги Тип услуги Бухгалтерия, финансы Место оказания услуг Москва, проезд Воскресенские Ворота Тип стоимости за услугу Начальная цена Опыт работы 10 лет и больше Берёте ли срочные заказы Как вы ра...</td>\n      <td>114</td>\n      <td>637640</td>\n    </tr>\n    <tr>\n      <th>213389</th>\n      <td>автоэлектрик</td>\n      <td>624360</td>\n      <td>0</td>\n      <td>Тип услуги автосервиса Диагностика и ремонт авто Вид услуги Автосервис, аренда Тип услуги Автосервис</td>\n      <td>114</td>\n      <td>1766935d306ef247</td>\n      <td>Выездной автоэлектрик. Компьютерная диагностика</td>\n      <td>Выезжаю по городу и области. Без выходных.\\n\\nЧто сделаю:\\n\\n✔ Компьютерная диагностика любой системы\\n\\n✔ Поиск скрытых неисправностей\\n\\n✔ Устранение проблем на месте\\n\\n✔ Гарантия на работы\\n\\nЛюбые марки авто. \\n...</td>\n      <td>Вид услуги Автосервис, аренда Тип услуги Автосервис Место оказания услуг Тракторная ул., 11 Гарантия Опыт работы 1 Тип стоимости за услугу Начальная цена Время для связи от 27000 Время для связи до 77400 Время для св...</td>\n      <td>114</td>\n      <td>624360</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "\nКатегории запросов в train:\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "search_category\n114    497635\n0          34\n81          2\n10          2\nName: count, dtype: int64"
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "\nКатегории объявлений в корпусе:\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "item_category_id\n114    187336\n19        357\n112       141\n40        122\n33        103\n10         98\n20         84\n25         82\n36         74\n111        74\n39         72\n24         70\n83         68\n27         57\n30         56\nName: count, dtype: int64"
+          },
+          "metadata": {}
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "data-summary"
+      },
+      "source": [
+        "### Что видно по данным\n",
+        "\n",
+        "В train получилось 354 463 разных комбинации признаков поиска. Для большинства известно одно выбранное объявление, в среднем около 1,32. Примерно 37% текстов benchmark уже встречались в train, но по всем признакам совпадает только 4,4% запросов.\n",
+        "\n",
+        "Почти все обучающие пары и объявления benchmark относятся к категории 114. Поэтому дальше опираемся на текст и проверяем локацию. Просто запомнить пары из train недостаточно: большая часть объявлений benchmark там не встречалась."
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-8"
+      },
+      "source": [
+        "### 7. Проверка локации\n",
+        "\n",
+        "Посчитаем, как часто пользователь выбирал объявление из той же локации, где искал. Отдельно посмотрим запросы с доставкой и без неё. Это поможет решить, стоит ли давать объявлениям из своей локации больший вес."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "same_location = (\n",
+        "    train[\"search_location_id\"] == train[\"item_location_id\"]\n",
+        ")\n",
+        "\n",
+        "print(\n",
+        "    \"Доля обучающих пар с одинаковой локацией запроса и объявления:\",\n",
+        "    f\"{same_location.mean():.2%}\"\n",
+        ")\n",
+        "\n",
+        "location_stats = (\n",
+        "    train.assign(same_location=same_location)\n",
+        "    .groupby(\"search_is_delivery_search\")\n",
+        "    .agg(\n",
+        "        pairs=(\"item_id\", \"size\"),\n",
+        "        same_location_share=(\"same_location\", \"mean\"),\n",
+        "    )\n",
+        ")\n",
+        "\n",
+        "display(location_stats)\n",
+        "\n",
+        "print(\"\\nСамые частые локации поиска:\")\n",
+        "display(train[\"search_location_id\"].value_counts().head(10))"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T18:32:59.228077Z",
+          "iopub.execute_input": "2026-09-28T18:32:59.228374Z",
+          "iopub.status.idle": "2026-09-28T18:32:59.414871Z",
+          "shell.execute_reply.started": "2026-09-28T18:32:59.228352Z",
+          "shell.execute_reply": "2026-09-28T18:32:59.414238Z"
+        },
+        "id": "cryn-yzLnePg",
+        "outputId": "e7dcb186-9121-4c8a-d7b6-6327ac202253"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Доля обучающих пар с одинаковой локацией запроса и объявления: 83.10%\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "                            pairs  same_location_share\nsearch_is_delivery_search                             \n0                          497661             0.831028\n1                              12             0.500000",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>pairs</th>\n      <th>same_location_share</th>\n    </tr>\n    <tr>\n      <th>search_is_delivery_search</th>\n      <th></th>\n      <th></th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>0</th>\n      <td>497661</td>\n      <td>0.831028</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>12</td>\n      <td>0.500000</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "\nСамые частые локации поиска:\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "search_location_id\n637640    36276\n653240    25229\n107620    12277\n633540    11441\n650400    10720\n654070     8204\n641780     8145\n625810     8106\n652000     7963\n646600     7706\nName: count, dtype: int64"
+          },
+          "metadata": {}
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-10"
+      },
+      "source": [
+        "### 8. Запросы для валидации\n",
+        "\n",
+        "Локации совпали в 83,10% обучающих пар. Значит, этот признак стоит проверить в поиске. По доставке всего 12 строк, так что делать отдельные выводы по ней пока не будем.\n",
+        "\n",
+        "Выбираем 1 000 разных текстов, для каждого оставляем одну случайную комбинацию локации и остальных признаков. В valid_truth собираем объявления, которые пользователи выбирали именно по этим запросам. Из train_fit исключаем все строки с выбранными текстами, даже если локация другая. Так проверяем поиск по текстам, которых не будет в обучении CatBoost."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# Тут для одного текста мы оставляем только один какой-то запрос полный.\n",
+        "validation_pool = (\n",
+        "    query_groups\n",
+        "    .sample(frac=1, random_state=SEED)\n",
+        "    .drop_duplicates(\"search_query\")\n",
+        ")\n",
+        "\n",
+        "N_VALID = min(1000, len(validation_pool))\n",
+        "\n",
+        "valid_queries = (\n",
+        "    validation_pool\n",
+        "    .sample(n=N_VALID, random_state=SEED)\n",
+        "    [search_cols]\n",
+        "    .reset_index(drop=True)\n",
+        ")\n",
+        "\n",
+        "# Присвоим номера запросам, потому что в train их нет.\n",
+        "valid_queries.insert(0, \"val_id\", np.arange(len(valid_queries)))\n",
+        "\n",
+        "# Тут для выбранных валидационных запросов находим объявления, которые пользователи выбирали по ним в train (совпадают все признаки)\n",
+        "valid_pairs = train.merge(\n",
+        "    valid_queries,\n",
+        "    on=search_cols,\n",
+        "    how=\"inner\",\n",
+        "    validate=\"many_to_one\",\n",
+        ")\n",
+        "\n",
+        "valid_truth = (\n",
+        "    valid_pairs.groupby(\"val_id\")[\"item_id\"]\n",
+        "    .agg(lambda values: set(values))\n",
+        "    .reindex(valid_queries[\"val_id\"])\n",
+        "    .tolist()\n",
+        ")\n",
+        "\n",
+        "# Убираем из обучения все строки с нашими выбранными валидационными текстами.\n",
+        "heldout_texts = set(valid_queries[\"search_query\"])\n",
+        "\n",
+        "# Чтобы не занимать лишнюю память, пока что оставим выбранные колонки объявлений. Если что, тексты есть в train и сможем замерджить\n",
+        "fit_columns = search_cols + [\n",
+        "    \"item_id\",\n",
+        "    \"item_microcat_id\",\n",
+        "    \"item_location_id\",\n",
+        "]\n",
+        "\n",
+        "train_fit = train.loc[\n",
+        "    ~train[\"search_query\"].isin(heldout_texts),\n",
+        "    fit_columns,\n",
+        "].copy()\n",
+        "\n",
+        "print(f\"Валидационных запросов: {len(valid_queries):,}\")\n",
+        "print(f\"Положительных пар для них: {len(valid_pairs):,}\")\n",
+        "print(f\"Строк в обучающей части: {len(train_fit):,}\")\n",
+        "print(\n",
+        "    \"Среднее число релевантных объявлений:\",\n",
+        "    round(np.mean([len(ids) for ids in valid_truth]), 2),\n",
+        ")"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T18:47:02.495892Z",
+          "iopub.execute_input": "2026-09-28T18:47:02.496459Z",
+          "iopub.status.idle": "2026-09-28T18:47:03.063462Z",
+          "shell.execute_reply.started": "2026-09-28T18:47:02.496431Z",
+          "shell.execute_reply": "2026-09-28T18:47:03.062585Z"
+        },
+        "id": "9KGcrS1gnePh",
+        "outputId": "9813633d-7c1f-47cf-ba66-1639d583dbdd"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Валидационных запросов: 1,000\nПоложительных пар для них: 1,093\nСтрок в обучающей части: 490,305\nСреднее число релевантных объявлений: 1.07\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-12"
+      },
+      "source": [
+        "### 9. Среди каких объявлений проверяем поиск\n",
+        "\n",
+        "Для валидации получилось 1 093 положительные пары, в среднем 1,07 разных выбранных объявлений на запрос. Некоторые из этих объявлений отсутствуют в benchmark_items. Если их не добавить, алгоритм просто не сможет найти правильный ответ.\n",
+        "\n",
+        "Создаём retrieval_items: сначала все объявления benchmark, затем недостающие объявления валидации. Алгоритм увидит их тексты и признаки, но не получит подсказку, для какого запроса они правильные. При подготовке итогового CSV добавленные объявления исключаем. Такая проверка удобна для сравнения методов, но её результат не обязан совпадать с оценкой на скрытом тесте."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# Здесь мы совместим бенчарковские объявления с нашими валидационными, первыми пойдут benchmark_items, а потом уже валидационные\n",
+        "items = items.reset_index(drop=True)\n",
+        "\n",
+        "extra_valid_items = (\n",
+        "    valid_pairs.loc[\n",
+        "        ~valid_pairs[\"item_id\"].isin(items[\"item_id\"]),\n",
+        "        items.columns,\n",
+        "    ]\n",
+        "    .drop_duplicates(\"item_id\")\n",
+        ")\n",
+        "\n",
+        "# вот собственно они и есть\n",
+        "retrieval_items = pd.concat(\n",
+        "    [items, extra_valid_items],\n",
+        "    ignore_index=True,\n",
+        ")\n",
+        "\n",
+        "retrieval_ids = retrieval_items[\"item_id\"].to_numpy()\n",
+        "retrieval_locations = retrieval_items[\"item_location_id\"].to_numpy()\n",
+        "\n",
+        "corpus_id_set = set(retrieval_ids)\n",
+        "\n",
+        "print(f\"Объявлений в benchmark: {len(items):,}\")\n",
+        "print(f\"Добавлено для валидации: {len(extra_valid_items):,}\")\n",
+        "print(f\"Всего в локальном корпусе: {len(retrieval_items):,}\")"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:00:50.131058Z",
+          "iopub.execute_input": "2026-09-28T19:00:50.131906Z",
+          "iopub.status.idle": "2026-09-28T19:00:50.222945Z",
+          "shell.execute_reply.started": "2026-09-28T19:00:50.131874Z",
+          "shell.execute_reply": "2026-09-28T19:00:50.222268Z"
+        },
+        "id": "i6qvVMoGnePh",
+        "outputId": "ebd931c1-1f6f-4f03-e6b7-8488818444a3"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Объявлений в benchmark: 189,212\nДобавлено для валидации: 990\nВсего в локальном корпусе: 190,202\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-13"
+      },
+      "source": [
+        "### 10. Подготовка текста\n",
+        "\n",
+        "Добавили 990 объявлений, всего для локальной проверки получилось 190 202. Теперь приводим тексты к нижнему регистру, заменяем ё на е и убираем лишние символы. В словах с кириллицей заменяем похожие латинские буквы; слова целиком на латинице оставляем.\n",
+        "\n",
+        "В document_texts объединяем заголовок, параметры и первые 2 500 символов описания. Заголовок повторяем дважды, чтобы увеличить его вклад. Отдельно сохраняем title_texts для поиска по частям слов в заголовке."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import re\n",
+        "import unicodedata\n",
+        "\n",
+        "# На всякий случай заменим латинские буквы, которые похожи на русские внутри слов, где уже есть русские буквы. англ названия сохраняем\n",
+        "lookalikes = str.maketrans({\n",
+        "    \"a\": \"а\",\n",
+        "    \"c\": \"с\",\n",
+        "    \"e\": \"е\",\n",
+        "    \"o\": \"о\",\n",
+        "    \"p\": \"р\",\n",
+        "    \"x\": \"х\",\n",
+        "    \"y\": \"у\",\n",
+        "    \"k\": \"к\",\n",
+        "    \"m\": \"м\",\n",
+        "    \"t\": \"т\",\n",
+        "    \"b\": \"в\",\n",
+        "    \"h\": \"н\",\n",
+        "})\n",
+        "\n",
+        "word_pattern = re.compile(r\"[a-zа-я0-9]+\")\n",
+        "cyrillic_pattern = re.compile(r\"[а-я]\")\n",
+        "\n",
+        "def normalize_text(value):\n",
+        "    if pd.isna(value):\n",
+        "        return \"\"\n",
+        "\n",
+        "    text = unicodedata.normalize(\"NFKC\", str(value)).lower()\n",
+        "    text = text.replace(\"ё\", \"е\")\n",
+        "\n",
+        "    words = word_pattern.findall(text)\n",
+        "\n",
+        "    return \" \".join(\n",
+        "        word.translate(lookalikes)\n",
+        "        if cyrillic_pattern.search(word)\n",
+        "        else word\n",
+        "        for word in words\n",
+        "    )\n",
+        "\n",
+        "start = time.time()\n",
+        "\n",
+        "title_texts = (\n",
+        "    retrieval_items[\"item_title_raw\"]\n",
+        "    .fillna(\"\")\n",
+        "    .map(normalize_text)\n",
+        ")\n",
+        "\n",
+        "# Повтор заголовка увеличивает его вес внутри текстового представления.\n",
+        "document_texts = (\n",
+        "    retrieval_items[\"item_title_raw\"].fillna(\"\") + \" \"\n",
+        "    + retrieval_items[\"item_title_raw\"].fillna(\"\") + \" \"\n",
+        "    + retrieval_items[\"item_infm_params_text\"].fillna(\"\") + \" \"\n",
+        "    + retrieval_items[\"item_description_raw\"].fillna(\"\").str.slice(0, 2500)\n",
+        ").map(normalize_text)\n",
+        "\n",
+        "print(f\"Подготовка текстов: {time.time() - start:.1f} сек.\")\n",
+        "print(\"\\nПример заголовка:\", title_texts.iloc[0])"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:00:57.240957Z",
+          "iopub.execute_input": "2026-09-28T19:00:57.241645Z",
+          "iopub.status.idle": "2026-09-28T19:02:43.800837Z",
+          "shell.execute_reply.started": "2026-09-28T19:00:57.241618Z",
+          "shell.execute_reply": "2026-09-28T19:02:43.800117Z"
+        },
+        "id": "-W6xxUgFnePh",
+        "outputId": "7a16ff56-24e7-4a67-bec6-156e86801c11"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Подготовка текстов: 106.6 сек.\n\nПример заголовка: ремонт выкуп компьют и ноутбуков с выездом на дом\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-14"
+      },
+      "source": [
+        "### 11. Переводим тексты в TF-IDF\n",
+        "\n",
+        "Строим два числовых представления объявлений. X_words учитывает отдельные слова из общего текста, а X_chars учитывает кусочки длиной от 3 до 5 символов в заголовке. Второй вариант помогает с некоторыми словоформами и опечатками. Матрицы хранятся в разреженном виде, чтобы не занимать лишнюю память."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "from sklearn.feature_extraction.text import TfidfVectorizer\n",
+        "\n",
+        "start = time.time()\n",
+        "\n",
+        "word_vectorizer = TfidfVectorizer(\n",
+        "    lowercase=False,\n",
+        "    token_pattern=r\"(?u)\\b\\w+\\b\",\n",
+        "    ngram_range=(1, 1),\n",
+        "    min_df=2,\n",
+        "    max_df=0.98,\n",
+        "    max_features=180_000,\n",
+        "    sublinear_tf=True,\n",
+        "    dtype=np.float32,\n",
+        ")\n",
+        "\n",
+        "X_words = word_vectorizer.fit_transform(document_texts)\n",
+        "\n",
+        "print(\n",
+        "    f\"Словарный индекс готов: {X_words.shape}, \"\n",
+        "    f\"{time.time() - start:.1f} сек.\"\n",
+        ")\n",
+        "\n",
+        "char_vectorizer = TfidfVectorizer(\n",
+        "    lowercase=False,\n",
+        "    analyzer=\"char_wb\",\n",
+        "    ngram_range=(3, 5),\n",
+        "    min_df=3,\n",
+        "    max_features=120_000,\n",
+        "    sublinear_tf=True,\n",
+        "    dtype=np.float32,\n",
+        ")\n",
+        "\n",
+        "X_chars = char_vectorizer.fit_transform(title_texts)\n",
+        "\n",
+        "print(\n",
+        "    f\"Символьный индекс готов: {X_chars.shape}, \"\n",
+        "    f\"общее время {time.time() - start:.1f} сек.\"\n",
+        ")"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:02:56.015543Z",
+          "iopub.execute_input": "2026-09-28T19:02:56.016289Z",
+          "iopub.status.idle": "2026-09-28T19:03:45.412003Z",
+          "shell.execute_reply.started": "2026-09-28T19:02:56.016259Z",
+          "shell.execute_reply": "2026-09-28T19:03:45.411199Z"
+        },
+        "id": "x1UJusw4nePi",
+        "outputId": "354ec343-7296-4706-b5f7-99ccecb000f1"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Словарный индекс готов: (190202, 180000), 40.0 сек.\nСимвольный индекс готов: (190202, 79259), общее время 48.6 сек.\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-15"
+      },
+      "source": [
+        "### 12. Первый поиск и Recall@50\n",
+        "\n",
+        "Для каждого запроса считаем сходство по словам и добавляем сходство по частям слов с весом 0,4. Затем пробуем множители 1, 2 и 4 для объявлений с совпадающей локацией. Объявления из других локаций не исключаем.\n",
+        "\n",
+        "Берём 50 лучших и сравниваем с valid_truth. Метрика сначала считает долю найденных правильных объявлений для каждого запроса, а потом усредняет эти доли."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "from tqdm.auto import tqdm\n",
+        "\n",
+        "def recall_at_50(predictions, truth):\n",
+        "    return float(np.mean([\n",
+        "        len(set(pred) & relevant) / len(relevant)\n",
+        "        for pred, relevant in zip(predictions, truth)\n",
+        "    ]))\n",
+        "\n",
+        "\n",
+        "def retrieve_tfidf(\n",
+        "    query_df,\n",
+        "    location_multipliers=(1.0, 2.0, 4.0),\n",
+        "    benchmark_only=False,\n",
+        "    batch_size=32,\n",
+        "):\n",
+        "    # Для получения baseline используем только сам запрос. Фильтры потом добавим отдельным экспериментом\n",
+        "    query_texts = query_df[\"search_query\"].map(normalize_text)\n",
+        "\n",
+        "\n",
+        "    Q_words = word_vectorizer.transform(query_texts)\n",
+        "    Q_chars = char_vectorizer.transform(query_texts)\n",
+        "\n",
+        "    # В финальном ответе ищем уже только среди benchmark_items\n",
+        "    n_docs = len(items) if benchmark_only else len(retrieval_items)\n",
+        "\n",
+        "    W = X_words[:n_docs].T.tocsr()\n",
+        "    C = X_chars[:n_docs].T.tocsr()\n",
+        "\n",
+        "    ids = retrieval_ids[:n_docs]\n",
+        "    locations = retrieval_locations[:n_docs]\n",
+        "    query_locations = query_df[\"search_location_id\"].to_numpy()\n",
+        "\n",
+        "    results = {m: [] for m in location_multipliers}\n",
+        "    k = min(50, n_docs)\n",
+        "\n",
+        "    for start in tqdm(range(0, len(query_df), batch_size)):\n",
+        "        end = min(start + batch_size, len(query_df))\n",
+        "\n",
+        "        # Тут считаем сходство запроса и объявления по словам\n",
+        "        scores = (Q_words[start:end] @ W).toarray()\n",
+        "        # Сходство по частям слов в заголовке добавляем с весом 0.4, чтобы найти разные формы слов и опечатки\n",
+        "        scores += 0.4 * (Q_chars[start:end] @ C).toarray()\n",
+        "\n",
+        "        for row, base_scores in enumerate(scores):\n",
+        "            same_loc = (\n",
+        "                locations == query_locations[start + row]\n",
+        "            )\n",
+        "\n",
+        "            for multiplier in location_multipliers:\n",
+        "                adjusted = base_scores.copy()\n",
+        "                adjusted[same_loc] *= multiplier\n",
+        "\n",
+        "                # Тут выбираем 50 лучших без полной сортировки корпуса\n",
+        "                top = np.argpartition(adjusted, -k)[-k:]\n",
+        "                top = top[np.argsort(-adjusted[top], kind=\"stable\")]\n",
+        "\n",
+        "                results[multiplier].append(ids[top].tolist())\n",
+        "\n",
+        "    return results\n",
+        "\n",
+        "\n",
+        "valid_predictions = retrieve_tfidf(valid_queries)\n",
+        "\n",
+        "validation_results = pd.DataFrame([\n",
+        "    {\n",
+        "        \"location_multiplier\": multiplier,\n",
+        "        \"Recall@50\": recall_at_50(predictions, valid_truth),\n",
+        "    }\n",
+        "    for multiplier, predictions in valid_predictions.items()\n",
+        "]).sort_values(\"Recall@50\", ascending=False)\n",
+        "\n",
+        "display(validation_results)"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:12:16.581452Z",
+          "iopub.execute_input": "2026-09-28T19:12:16.582238Z",
+          "iopub.status.idle": "2026-09-28T19:12:29.654569Z",
+          "shell.execute_reply.started": "2026-09-28T19:12:16.582205Z",
+          "shell.execute_reply": "2026-09-28T19:12:29.653880Z"
+        },
+        "id": "AB1ZD_E0nePi",
+        "outputId": "237cd81a-050b-416f-d820-5184505bb8a7",
+        "colab": {
+          "referenced_widgets": [
+            "f8f1f989e91145c38011b7cbf9f9025c"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "  0%|          | 0/32 [00:00<?, ?it/s]",
+            "application/vnd.jupyter.widget-view+json": {
+              "version_major": 2,
+              "version_minor": 0,
+              "model_id": "f8f1f989e91145c38011b7cbf9f9025c"
+            }
+          },
+          "metadata": {}
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "   location_multiplier  Recall@50\n2                  4.0   0.740100\n1                  2.0   0.650600\n0                  1.0   0.335667",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>location_multiplier</th>\n      <th>Recall@50</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>2</th>\n      <td>4.0</td>\n      <td>0.740100</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>2.0</td>\n      <td>0.650600</td>\n    </tr>\n    <tr>\n      <th>0</th>\n      <td>1.0</td>\n      <td>0.335667</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-16"
+      },
+      "source": [
+        "### 13. Сохраняем baseline\n",
+        "\n",
+        "Без учёта локации получили Recall@50 = 0,3357. Множитель 2 дал 0,6506, а множитель 4 дал 0,7401. Из проверенных вариантов выбираем 4.\n",
+        "\n",
+        "Теперь запускаем поиск для запросов benchmark, уже только среди исходных объявлений items. Проверяем ID, повторы и число кандидатов, затем сохраняем answer_baseline.csv. Это первый готовый ответ, который оставим для сравнения."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "best_multiplier = float(\n",
+        "    validation_results.iloc[0][\"location_multiplier\"]\n",
+        ")\n",
+        "\n",
+        "benchmark_predictions = retrieve_tfidf(\n",
+        "    queries,\n",
+        "    location_multipliers=(best_multiplier,),\n",
+        "    benchmark_only=True,\n",
+        ")[best_multiplier]\n",
+        "\n",
+        "answer = pd.DataFrame({\n",
+        "    \"query_id\": queries[\"query_id\"],\n",
+        "    \"answer\": [\" \".join(ids) for ids in benchmark_predictions],\n",
+        "})\n",
+        "\n",
+        "benchmark_id_set = set(items[\"item_id\"])\n",
+        "\n",
+        "assert list(answer.columns) == [\"query_id\", \"answer\"]\n",
+        "assert len(answer) == len(queries)\n",
+        "assert answer[\"query_id\"].is_unique\n",
+        "assert set(answer[\"query_id\"]) == set(queries[\"query_id\"])\n",
+        "\n",
+        "for prediction in benchmark_predictions:\n",
+        "    assert 0 < len(prediction) <= 50\n",
+        "    assert len(prediction) == len(set(prediction))\n",
+        "    assert all(item_id in benchmark_id_set for item_id in prediction)\n",
+        "\n",
+        "answer.to_csv(\n",
+        "    OUTPUT_DIR / \"answer_baseline.csv\",\n",
+        "    index=False,\n",
+        "    encoding=\"utf-8\",\n",
+        ")\n",
+        "\n",
+        "print(\"Сохранён:\", OUTPUT_DIR / \"answer_baseline.csv\")\n",
+        "print(\"Лучший множитель локации:\", best_multiplier)\n",
+        "display(answer.head(3))"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:16:11.469102Z",
+          "iopub.execute_input": "2026-09-28T19:16:11.469428Z",
+          "iopub.status.idle": "2026-09-28T19:16:29.320134Z",
+          "shell.execute_reply.started": "2026-09-28T19:16:11.469403Z",
+          "shell.execute_reply": "2026-09-28T19:16:29.319489Z"
+        },
+        "id": "pQfWP6qAnePi",
+        "outputId": "9ee9fb54-85ed-47ed-cc1c-099bbaec19b2",
+        "colab": {
+          "referenced_widgets": [
+            "f0164f5340fa41bf99392cf9c68b72ee"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "  0%|          | 0/77 [00:00<?, ?it/s]",
+            "application/vnd.jupyter.widget-view+json": {
+              "version_major": 2,
+              "version_minor": 0,
+              "model_id": "f0164f5340fa41bf99392cf9c68b72ee"
+            }
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "Сохранён: /kaggle/working/answer_baseline.csv\nЛучший множитель локации: 4.0\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "           query_id                                             answer\n0  70DfDUpwjxB4lzFd  b92ee8f432cec2d1 deb58d7ad8c27d06 6042fecdd775...\n1  JTrdTaZJvSiLPkXj  cbeccbecb1fb8d86 16ea26ff0aa0450a 367af128a9ea...\n2  LZCZNoVG4AFUkVRJ  3f89b8062dc85f1c d8fce513e4f000a7 dab52187b450...",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>query_id</th>\n      <th>answer</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>0</th>\n      <td>70DfDUpwjxB4lzFd</td>\n      <td>b92ee8f432cec2d1 deb58d7ad8c27d06 6042fecdd775...</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>JTrdTaZJvSiLPkXj</td>\n      <td>cbeccbecb1fb8d86 16ea26ff0aa0450a 367af128a9ea...</td>\n    </tr>\n    <tr>\n      <th>2</th>\n      <td>LZCZNoVG4AFUkVRJ</td>\n      <td>3f89b8062dc85f1c d8fce513e4f000a7 dab52187b450...</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-17"
+      },
+      "source": [
+        "### 14. Готовим запросы для CatBoost\n",
+        "\n",
+        "Baseline получил 0,690 на Stepik. Попробуем улучшить отбор 50 объявлений с помощью CatBoost.\n",
+        "\n",
+        "Из train_fit берём пары, где выбранное объявление есть в retrieval_items: для него уже рассчитан TF-IDF. Собираем правильные ответы по каждому набору признаков поиска и выбираем до 3 000 запросов. Это быстрая обучающая выборка по доступному пересечению, а не весь train. Валидационные тексты в неё не входят."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "from catboost import CatBoostClassifier\n",
+        "import gc\n",
+        "\n",
+        "# Берем из train_fit только те пары, объявления которых есть в retrieval. Для них уже расчитан TF-IDF\n",
+        "available_train = train_fit[\n",
+        "    train_fit[\"item_id\"].isin(retrieval_ids)\n",
+        "]\n",
+        "\n",
+        "# Тут собираем множество выбранных объявлений, которые известны в retrieval для каждого запроса (комбинация текста, локации, фильтров)\n",
+        "cb_groups = (\n",
+        "    available_train\n",
+        "    .groupby(search_cols, dropna=False, observed=True)[\"item_id\"]\n",
+        "    .agg(lambda values: set(values))\n",
+        "    .reset_index(name=\"relevant_ids\")\n",
+        ")\n",
+        "\n",
+        "cb_groups = cb_groups.sample(\n",
+        "    n=min(3000, len(cb_groups)),\n",
+        "    random_state=SEED,\n",
+        ").reset_index(drop=True)\n",
+        "\n",
+        "cb_queries = cb_groups[search_cols].copy()\n",
+        "cb_truth = cb_groups[\"relevant_ids\"].tolist()\n",
+        "\n",
+        "print(\"Запросов для обучения CatBoost:\", len(cb_queries))"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:35:01.413022Z",
+          "iopub.execute_input": "2026-09-28T19:35:01.413360Z",
+          "iopub.status.idle": "2026-09-28T19:35:03.476608Z",
+          "shell.execute_reply.started": "2026-09-28T19:35:01.413334Z",
+          "shell.execute_reply": "2026-09-28T19:35:03.475687Z"
+        },
+        "id": "NGLB4mLdnePj",
+        "outputId": "55bc0098-4e12-4eb1-b4bf-44dbc9e47d02"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Запросов для обучения CatBoost: 3000\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-18"
+      },
+      "source": [
+        "### 15. Числовые признаки объявлений\n",
+        "\n",
+        "Подготовим рейтинг, цену, число отзывов и признаки доступности связи. Пропущенный рейтинг заменяем на -1, а пропуски в цене и числе отзывов на 0. К цене и числу отзывов применяем log(1 + x), чтобы уменьшить разброс больших значений.\n",
+        "\n",
+        "FEATURE_NAMES хранит названия будущих признаков CatBoost. Кроме полей объявления, туда войдут текстовые сходства и совпадение локации и категории."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "def numeric_values(column, default):\n",
+        "    return (\n",
+        "        pd.to_numeric(retrieval_items[column], errors=\"coerce\")\n",
+        "        .fillna(default)\n",
+        "        .to_numpy(dtype=np.float32)\n",
+        "    )\n",
+        "\n",
+        "item_rating_values = numeric_values(\"item_rating\", -1)\n",
+        "item_review_values = np.log1p(\n",
+        "    np.maximum(numeric_values(\"item_rating_reviews_count\", 0), 0)\n",
+        ")\n",
+        "item_price_values = np.log1p(\n",
+        "    np.maximum(numeric_values(\"item_price\", 0), 0)\n",
+        ")\n",
+        "\n",
+        "item_categories = retrieval_items[\"item_category_id\"].to_numpy()\n",
+        "\n",
+        "item_phone_hidden = (\n",
+        "    retrieval_items[\"item_is_phone_hidden\"]\n",
+        "    .fillna(False).to_numpy(dtype=np.float32)\n",
+        ")\n",
+        "item_messages_forbidden = (\n",
+        "    retrieval_items[\"item_is_message_forbidden\"]\n",
+        "    .fillna(False).to_numpy(dtype=np.float32)\n",
+        ")\n",
+        "\n",
+        "FEATURE_NAMES = [\n",
+        "    \"word_similarity\",\n",
+        "    \"char_similarity\",\n",
+        "    \"filter_similarity\",\n",
+        "    \"same_location\",\n",
+        "    \"text_score\",\n",
+        "    \"text_score_location4\",\n",
+        "    \"rating\",\n",
+        "    \"log_reviews\",\n",
+        "    \"log_price\",\n",
+        "    \"same_category\",\n",
+        "    \"phone_hidden\",\n",
+        "    \"messages_forbidden\",\n",
+        "]"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:35:20.783935Z",
+          "iopub.execute_input": "2026-09-28T19:35:20.784510Z",
+          "iopub.status.idle": "2026-09-28T19:35:21.242601Z",
+          "shell.execute_reply.started": "2026-09-28T19:35:20.784483Z",
+          "shell.execute_reply": "2026-09-28T19:35:21.242026Z"
+        },
+        "id": "Oukutw4BnePj"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-19"
+      },
+      "source": [
+        "### 16. Собираем больше кандидатов\n",
+        "\n",
+        "Для каждого запроса берём по 150 лучших объявлений при множителях локации 1, 4 и 16. Объединяем списки и удаляем повторы, получается не больше 450 кандидатов. Для каждой пары запроса и кандидата собираем признаки для CatBoost.\n",
+        "\n",
+        "Текст фильтров сравниваем с текстом объявления, но выполнение условий вроде «рейтинг от 4» этим не проверяем. Категорию запроса 0 считаем отсутствием ограничения; это наше предположение о значении поля.\n",
+        "\n",
+        "В конце считаем, какую долю правильных ответов нашли среди всех кандидатов. Это верхняя граница для следующего этапа: CatBoost не сможет вернуть объявление, которое сюда не попало."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "def top_indices(scores, k):\n",
+        "    k = min(k, len(scores))\n",
+        "    selected = np.argpartition(scores, -k)[-k:]\n",
+        "    return selected[\n",
+        "        np.argsort(-scores[selected], kind=\"stable\")\n",
+        "    ]\n",
+        "\n",
+        "def build_candidate_packs(query_df, benchmark_only=False, batch_size=32):\n",
+        "    n_docs = len(items) if benchmark_only else len(retrieval_items)\n",
+        "\n",
+        "    # Теперь берем TF-IDF нужных объявлений и для локальной проверки всего retrieval, а для отправки только из benchmark\n",
+        "\n",
+        "    W = X_words[:n_docs].T.tocsr()\n",
+        "    C = X_chars[:n_docs].T.tocsr()\n",
+        "\n",
+        "    query_texts = query_df[\"search_query\"].map(normalize_text)\n",
+        "    filter_texts = query_df[\"search_infm_params_text\"].map(normalize_text)\n",
+        "\n",
+        "    Qw = word_vectorizer.transform(query_texts)\n",
+        "    Qc = char_vectorizer.transform(query_texts)\n",
+        "    Qf = word_vectorizer.transform(filter_texts)\n",
+        "\n",
+        "    q_locations = query_df[\"search_location_id\"].to_numpy()\n",
+        "    q_categories = query_df[\"search_category\"].to_numpy()\n",
+        "\n",
+        "    packs = []\n",
+        "\n",
+        "    for start in tqdm(range(0, len(query_df), batch_size)):\n",
+        "        end = min(start + batch_size, len(query_df))\n",
+        "\n",
+        "        word_scores = (Qw[start:end] @ W).toarray()\n",
+        "        char_scores = (Qc[start:end] @ C).toarray()\n",
+        "\n",
+        "        # Тут сравниваем слова из фильтров поиска со словами в объявлении. Их сходство передадим в CatBoost отдельным признаком.\n",
+        "        # При этом мы не сравниваем числовые условия на сходство (например, «рейтинг от 4»)\n",
+        "        filter_scores = (Qf[start:end] @ W).toarray()\n",
+        "\n",
+        "        for row in range(end - start):\n",
+        "            query_number = start + row\n",
+        "\n",
+        "            base = word_scores[row] + 0.4 * char_scores[row]\n",
+        "            same_location = (\n",
+        "                retrieval_locations[:n_docs] == q_locations[query_number]\n",
+        "            )\n",
+        "\n",
+        "            candidates = np.unique(np.concatenate([\n",
+        "                top_indices(base, 150),\n",
+        "                top_indices(base * (1 + 3 * same_location), 150),\n",
+        "                top_indices(base * (1 + 15 * same_location), 150),\n",
+        "            ]))\n",
+        "\n",
+        "            same = same_location[candidates].astype(np.float32)\n",
+        "            text = base[candidates]\n",
+        "\n",
+        "            # наш признак равен единице, если категории совпадают. Если search_category = 0, то считаем, что\n",
+        "            # ограничений нет и поэтому на совпадение тоже ставим признаку 1\n",
+        "            category_match = (\n",
+        "                (q_categories[query_number] == 0)\n",
+        "                | (item_categories[candidates] == q_categories[query_number])\n",
+        "            ).astype(np.float32)\n",
+        "\n",
+        "            features = np.column_stack([\n",
+        "                word_scores[row, candidates],\n",
+        "                char_scores[row, candidates],\n",
+        "                filter_scores[row, candidates],\n",
+        "                same,\n",
+        "                text,\n",
+        "                text * (1 + 3 * same),\n",
+        "                item_rating_values[candidates],\n",
+        "                item_review_values[candidates],\n",
+        "                item_price_values[candidates],\n",
+        "                category_match,\n",
+        "                item_phone_hidden[candidates],\n",
+        "                item_messages_forbidden[candidates],\n",
+        "            ]).astype(np.float32)\n",
+        "\n",
+        "            packs.append({\n",
+        "                \"indices\": candidates,\n",
+        "                \"features\": features,\n",
+        "            })\n",
+        "\n",
+        "    return packs\n",
+        "\n",
+        "\n",
+        "print(\"Кандидаты для обучения:\")\n",
+        "train_packs = build_candidate_packs(cb_queries)\n",
+        "\n",
+        "print(\"Кандидаты для валидации:\")\n",
+        "valid_packs = build_candidate_packs(valid_queries)\n",
+        "\n",
+        "# теперь проверяем, какую долю правильных ответов нашёл первый этап. CatBoost будет выбирать только из этих кандидатов, потому\n",
+        "# пропущенные первым этапом объвления он уже не сможет просматривать\n",
+        "\n",
+        "candidate_coverage = np.mean([\n",
+        "    len(set(retrieval_ids[pack[\"indices\"]]) & truth) / len(truth)\n",
+        "    for pack, truth in zip(valid_packs, valid_truth)\n",
+        "])\n",
+        "\n",
+        "print(f\"Полнота расширенного списка кандидатов: {candidate_coverage:.4f}\")"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:44:01.777802Z",
+          "iopub.execute_input": "2026-09-28T19:44:01.778248Z",
+          "iopub.status.idle": "2026-09-28T19:45:01.718498Z",
+          "shell.execute_reply.started": "2026-09-28T19:44:01.778213Z",
+          "shell.execute_reply": "2026-09-28T19:45:01.717622Z"
+        },
+        "id": "Y-_W1M0znePj",
+        "outputId": "a3eb190e-cabb-4374-e39c-25df71c084c2",
+        "colab": {
+          "referenced_widgets": [
+            "0f2b1d2a55744266b2cb0133d98ec8c3",
+            "ff90939e55a54566974f26de63333174"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Кандидаты для обучения:\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "  0%|          | 0/94 [00:00<?, ?it/s]",
+            "application/vnd.jupyter.widget-view+json": {
+              "version_major": 2,
+              "version_minor": 0,
+              "model_id": "0f2b1d2a55744266b2cb0133d98ec8c3"
+            }
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "Кандидаты для валидации:\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "  0%|          | 0/32 [00:00<?, ?it/s]",
+            "application/vnd.jupyter.widget-view+json": {
+              "version_major": 2,
+              "version_minor": 0,
+              "model_id": "ff90939e55a54566974f26de63333174"
+            }
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "Полнота расширенного списка кандидатов: 0.8520\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-20"
+      },
+      "source": [
+        "### 17. Обучаем CatBoost\n",
+        "\n",
+        "Расширенные списки нашли 85,20% правильных ответов в среднем по запросам. Теперь учим модель выбирать из них 50. Ставим метку 1 известным выбранным объявлениям и 0 остальным кандидатам. Ноль означает, что выбор не наблюдался, а не что объявление точно не подходит.\n",
+        "\n",
+        "При обучении пропускаем запросы, где первый этап не нашёл ни одного правильного ответа. На валидации такие запросы остаются. Каждому обучающему запросу даём одинаковый общий вес, независимо от числа кандидатов. Обучаем 500 деревьев на GPU, сохраняем модель и смотрим важность признаков."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "train_feature_blocks = []\n",
+        "train_label_blocks = []\n",
+        "train_weight_blocks = []\n",
+        "\n",
+        "skipped_queries = 0\n",
+        "\n",
+        "for pack, truth in zip(train_packs, cb_truth):\n",
+        "    candidate_ids = retrieval_ids[pack[\"indices\"]]\n",
+        "\n",
+        "    labels = np.array(\n",
+        "        [item_id in truth for item_id in candidate_ids],\n",
+        "        dtype=np.int32,\n",
+        "    )\n",
+        "\n",
+        "    if labels.sum() == 0:\n",
+        "        skipped_queries += 1\n",
+        "        continue\n",
+        "\n",
+        "    train_feature_blocks.append(pack[\"features\"])\n",
+        "    train_label_blocks.append(labels)\n",
+        "\n",
+        "    # Мы делим общий вес запроса поровну между его объявлениями. Это нужно, потому что запросы с большим количество кандидатов\n",
+        "    # не получают больший суммарный вес в обучении просто из-за числа строк\n",
+        "    train_weight_blocks.append(\n",
+        "        np.full(len(labels), 1.0 / len(labels), dtype=np.float32)\n",
+        "    )\n",
+        "\n",
+        "X_cb_train = np.vstack(train_feature_blocks)\n",
+        "y_cb_train = np.concatenate(train_label_blocks)\n",
+        "weights_cb = np.concatenate(train_weight_blocks)\n",
+        "\n",
+        "# Тут приводим средний вес строки к 1\n",
+        "weights_cb /= weights_cb.mean()\n",
+        "\n",
+        "print(\"Обучающих пар:\", len(y_cb_train))\n",
+        "print(\"Положительных пар:\", y_cb_train.sum())\n",
+        "print(\"Пропущено запросов без найденных положительных:\", skipped_queries)\n",
+        "\n",
+        "cb_model = CatBoostClassifier(\n",
+        "    iterations=500,\n",
+        "    depth=6,\n",
+        "    learning_rate=0.06,\n",
+        "    loss_function=\"Logloss\",\n",
+        "    task_type=\"GPU\",\n",
+        "    devices=\"0\",\n",
+        "    random_seed=SEED,\n",
+        "    verbose=100,\n",
+        "    allow_writing_files=False,\n",
+        ")\n",
+        "\n",
+        "# Правильные ответы для валидации в обучение не передаем\n",
+        "cb_model.fit(\n",
+        "    X_cb_train,\n",
+        "    y_cb_train,\n",
+        "    sample_weight=weights_cb,\n",
+        ")\n",
+        "\n",
+        "cb_model.save_model(str(OUTPUT_DIR / \"catboost_retrieval.cbm\"))\n",
+        "\n",
+        "display(\n",
+        "    pd.DataFrame({\n",
+        "        \"feature\": FEATURE_NAMES,\n",
+        "        \"importance\": cb_model.feature_importances_,\n",
+        "    }).sort_values(\"importance\", ascending=False)\n",
+        ")"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:47:54.123167Z",
+          "iopub.execute_input": "2026-09-28T19:47:54.123595Z",
+          "iopub.status.idle": "2026-09-28T19:47:59.971413Z",
+          "shell.execute_reply.started": "2026-09-28T19:47:54.123567Z",
+          "shell.execute_reply": "2026-09-28T19:47:59.970438Z"
+        },
+        "id": "wvWoQSPWnePj",
+        "outputId": "1b745431-8b87-4fed-e9e1-aedf0e5182c9"
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Обучающих пар: 584316\nПоложительных пар: 2880\nПропущено запросов без найденных положительных: 399\n0:\tlearn: 0.5324873\ttotal: 189ms\tremaining: 1m 34s\n100:\tlearn: 0.0242230\ttotal: 1.12s\tremaining: 4.42s\n200:\tlearn: 0.0236549\ttotal: 1.92s\tremaining: 2.85s\n300:\tlearn: 0.0232545\ttotal: 2.7s\tremaining: 1.78s\n400:\tlearn: 0.0228613\ttotal: 3.47s\tremaining: 858ms\n499:\tlearn: 0.0225173\ttotal: 4.26s\tremaining: 0us\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "                 feature  importance\n3          same_location   21.797443\n7            log_reviews   12.836682\n1        char_similarity   12.568989\n0        word_similarity   11.993858\n2      filter_similarity   11.000389\n4             text_score    9.088160\n8              log_price    8.008487\n6                 rating    6.704173\n5   text_score_location4    3.669123\n11    messages_forbidden    1.316020\n10          phone_hidden    0.917160\n9          same_category    0.099516",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>feature</th>\n      <th>importance</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>3</th>\n      <td>same_location</td>\n      <td>21.797443</td>\n    </tr>\n    <tr>\n      <th>7</th>\n      <td>log_reviews</td>\n      <td>12.836682</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>char_similarity</td>\n      <td>12.568989</td>\n    </tr>\n    <tr>\n      <th>0</th>\n      <td>word_similarity</td>\n      <td>11.993858</td>\n    </tr>\n    <tr>\n      <th>2</th>\n      <td>filter_similarity</td>\n      <td>11.000389</td>\n    </tr>\n    <tr>\n      <th>4</th>\n      <td>text_score</td>\n      <td>9.088160</td>\n    </tr>\n    <tr>\n      <th>8</th>\n      <td>log_price</td>\n      <td>8.008487</td>\n    </tr>\n    <tr>\n      <th>6</th>\n      <td>rating</td>\n      <td>6.704173</td>\n    </tr>\n    <tr>\n      <th>5</th>\n      <td>text_score_location4</td>\n      <td>3.669123</td>\n    </tr>\n    <tr>\n      <th>11</th>\n      <td>messages_forbidden</td>\n      <td>1.316020</td>\n    </tr>\n    <tr>\n      <th>10</th>\n      <td>phone_hidden</td>\n      <td>0.917160</td>\n    </tr>\n    <tr>\n      <th>9</th>\n      <td>same_category</td>\n      <td>0.099516</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-21"
+      },
+      "source": [
+        "### 18. Проверяем модель и смеси\n",
+        "\n",
+        "Обучили CatBoost на 584 316 парах, из них 2 880 положительных. При подготовке обучения пропустили 399 запросов без найденных правильных кандидатов. Самым важным признаком оказалось совпадение локации.\n",
+        "\n",
+        "Теперь сравним текстовый поиск, CatBoost и их смеси. В смеси учитываем место объявления в каждом списке: вклад равен 1 / (60 + место), затем складываем вклады с выбранными весами. Вес CatBoost 0 означает только текстовый поиск, 1 означает только модель. Также пробуем множители локации 4, 8 и 16.\n",
+        "\n",
+        "Настройки выбираем по той же валидации, поэтому лучший результат здесь не считаем независимой оценкой качества на новых данных."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "def get_cb_scores(packs):\n",
+        "    lengths = [len(pack[\"indices\"]) for pack in packs]\n",
+        "    features = np.vstack([pack[\"features\"] for pack in packs])\n",
+        "\n",
+        "    scores = cb_model.predict_proba(features)[:, 1]\n",
+        "\n",
+        "    return np.split(scores, np.cumsum(lengths)[:-1])\n",
+        "\n",
+        "\n",
+        "valid_cb_scores = get_cb_scores(valid_packs)\n",
+        "\n",
+        "\n",
+        "def reciprocal_ranks(scores):\n",
+        "    order = np.argsort(-scores, kind=\"stable\")\n",
+        "    ranks = np.empty(len(scores), dtype=np.float32)\n",
+        "    ranks[order] = np.arange(1, len(scores) + 1)\n",
+        "\n",
+        "    return 1.0 / (60.0 + ranks)\n",
+        "\n",
+        "\n",
+        "def predict_mixture(packs, model_scores, location_multiplier, cb_weight):\n",
+        "    predictions = []\n",
+        "\n",
+        "    for pack, cb_scores in zip(packs, model_scores):\n",
+        "        features = pack[\"features\"]\n",
+        "\n",
+        "        text_scores = features[:, 4]\n",
+        "        same_location = features[:, 3]\n",
+        "\n",
+        "        lexical_scores = text_scores * (\n",
+        "            1 + (location_multiplier - 1) * same_location\n",
+        "        )\n",
+        "\n",
+        "        if cb_weight == 0:\n",
+        "            scores = lexical_scores\n",
+        "        elif cb_weight == 1:\n",
+        "            scores = cb_scores\n",
+        "        else:\n",
+        "            scores = (\n",
+        "                (1 - cb_weight) * reciprocal_ranks(lexical_scores)\n",
+        "                + cb_weight * reciprocal_ranks(cb_scores)\n",
+        "            )\n",
+        "\n",
+        "        chosen = top_indices(scores, 50)\n",
+        "        item_positions = pack[\"indices\"][chosen]\n",
+        "\n",
+        "        predictions.append(retrieval_ids[item_positions].tolist())\n",
+        "\n",
+        "    return predictions\n",
+        "\n",
+        "\n",
+        "experiment_rows = []\n",
+        "experiment_predictions = {}\n",
+        "\n",
+        "for multiplier in [4.0, 8.0, 16.0]:\n",
+        "    for cb_weight in [0.0, 0.25, 0.5, 0.75, 1.0]:\n",
+        "        # Мы проверяем чистый CatBoost один раз, потому что при весе CatBoost = 1 мы используем только оценки обученной модели;\n",
+        "        # множитель текстовой оценки на результат уже не влияет,\n",
+        "        if cb_weight == 1.0 and multiplier != 4.0:\n",
+        "            continue\n",
+        "\n",
+        "        key = (multiplier, cb_weight)\n",
+        "\n",
+        "        predictions = predict_mixture(\n",
+        "            valid_packs,\n",
+        "            valid_cb_scores,\n",
+        "            location_multiplier=multiplier,\n",
+        "            cb_weight=cb_weight,\n",
+        "        )\n",
+        "\n",
+        "        experiment_predictions[key] = predictions\n",
+        "\n",
+        "        experiment_rows.append({\n",
+        "            \"location_multiplier\": multiplier,\n",
+        "            \"catboost_weight\": cb_weight,\n",
+        "            \"Recall@50\": recall_at_50(predictions, valid_truth),\n",
+        "        })\n",
+        "\n",
+        "experiments = (\n",
+        "    pd.DataFrame(experiment_rows)\n",
+        "    .sort_values(\"Recall@50\", ascending=False)\n",
+        "    .reset_index(drop=True)\n",
+        ")\n",
+        "\n",
+        "display(experiments)\n",
+        "print(\"Исходный baseline:\", recall_at_50(\n",
+        "    valid_predictions[best_multiplier], valid_truth\n",
+        "))"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:50:45.008960Z",
+          "iopub.execute_input": "2026-09-28T19:50:45.009381Z",
+          "iopub.status.idle": "2026-09-28T19:50:45.970008Z",
+          "shell.execute_reply.started": "2026-09-28T19:50:45.009353Z",
+          "shell.execute_reply": "2026-09-28T19:50:45.969132Z"
+        },
+        "id": "So8fXgdNnePk",
+        "outputId": "bc95b179-ffd5-4428-f00c-3c8de8ef1251"
+      },
+      "outputs": [
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "    location_multiplier  catboost_weight  Recall@50\n0                  16.0             0.50   0.782933\n1                   8.0             0.50   0.781933\n2                  16.0             0.25   0.775433\n3                  16.0             0.00   0.774100\n4                   8.0             0.00   0.773600\n5                  16.0             0.75   0.771400\n6                   8.0             0.25   0.770433\n7                   8.0             0.75   0.769400\n8                   4.0             0.50   0.768433\n9                   4.0             0.75   0.765400\n10                  4.0             1.00   0.747700\n11                  4.0             0.25   0.745433\n12                  4.0             0.00   0.740100",
+            "text/html": "<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>location_multiplier</th>\n      <th>catboost_weight</th>\n      <th>Recall@50</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>0</th>\n      <td>16.0</td>\n      <td>0.50</td>\n      <td>0.782933</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>8.0</td>\n      <td>0.50</td>\n      <td>0.781933</td>\n    </tr>\n    <tr>\n      <th>2</th>\n      <td>16.0</td>\n      <td>0.25</td>\n      <td>0.775433</td>\n    </tr>\n    <tr>\n      <th>3</th>\n      <td>16.0</td>\n      <td>0.00</td>\n      <td>0.774100</td>\n    </tr>\n    <tr>\n      <th>4</th>\n      <td>8.0</td>\n      <td>0.00</td>\n      <td>0.773600</td>\n    </tr>\n    <tr>\n      <th>5</th>\n      <td>16.0</td>\n      <td>0.75</td>\n      <td>0.771400</td>\n    </tr>\n    <tr>\n      <th>6</th>\n      <td>8.0</td>\n      <td>0.25</td>\n      <td>0.770433</td>\n    </tr>\n    <tr>\n      <th>7</th>\n      <td>8.0</td>\n      <td>0.75</td>\n      <td>0.769400</td>\n    </tr>\n    <tr>\n      <th>8</th>\n      <td>4.0</td>\n      <td>0.50</td>\n      <td>0.768433</td>\n    </tr>\n    <tr>\n      <th>9</th>\n      <td>4.0</td>\n      <td>0.75</td>\n      <td>0.765400</td>\n    </tr>\n    <tr>\n      <th>10</th>\n      <td>4.0</td>\n      <td>1.00</td>\n      <td>0.747700</td>\n    </tr>\n    <tr>\n      <th>11</th>\n      <td>4.0</td>\n      <td>0.25</td>\n      <td>0.745433</td>\n    </tr>\n    <tr>\n      <th>12</th>\n      <td>4.0</td>\n      <td>0.00</td>\n      <td>0.740100</td>\n    </tr>\n  </tbody>\n</table>\n</div>"
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "Исходный baseline: 0.7401\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "explanation-22"
+      },
+      "source": [
+        "### 19. Выбираем итоговый вариант и сохраняем ответ\n",
+        "\n",
+        "Лучший результат на валидации дала смесь с весом CatBoost 0,5 и множителем локации 16: Recall@50 = 0,7829. Для сравнения, чистый CatBoost дал 0,7477, текстовый поиск с множителем 16 дал 0,7741, а исходный baseline дал 0,7401. Вес 0,5 относится к сумме оценок по местам, а не к выбору 25 объявлений из каждого списка.\n",
+        "\n",
+        "Применяем выбранный вариант к benchmark, проверяем формат и сохраняем answer.csv. Объявления, добавленные только для валидации, в финальный поиск не включаем. Таблицу экспериментов тоже сохраняем, чтобы остались результаты сравнения."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "best_row = experiments.iloc[0]\n",
+        "\n",
+        "original_recall = recall_at_50(\n",
+        "    valid_predictions[best_multiplier],\n",
+        "    valid_truth,\n",
+        ")\n",
+        "\n",
+        "if best_row[\"Recall@50\"] > original_recall:\n",
+        "    print(\"Готовим ответы улучшенного варианта.\")\n",
+        "\n",
+        "    benchmark_packs = build_candidate_packs(\n",
+        "        queries,\n",
+        "        benchmark_only=True,\n",
+        "    )\n",
+        "\n",
+        "    benchmark_cb_scores = get_cb_scores(benchmark_packs)\n",
+        "\n",
+        "    final_predictions = predict_mixture(\n",
+        "        benchmark_packs,\n",
+        "        benchmark_cb_scores,\n",
+        "        location_multiplier=float(best_row[\"location_multiplier\"]),\n",
+        "        cb_weight=float(best_row[\"catboost_weight\"]),\n",
+        "    )\n",
+        "\n",
+        "    print(\"Выбранные настройки:\")\n",
+        "    print(best_row)\n",
+        "\n",
+        "else:\n",
+        "    print(\"Прироста нет — сохраняем исходный baseline.\")\n",
+        "    final_predictions = benchmark_predictions\n",
+        "\n",
+        "final_answer = pd.DataFrame({\n",
+        "    \"query_id\": queries[\"query_id\"],\n",
+        "    \"answer\": [\" \".join(ids) for ids in final_predictions],\n",
+        "})\n",
+        "\n",
+        "allowed_ids = set(items[\"item_id\"])\n",
+        "\n",
+        "assert len(final_answer) == len(queries)\n",
+        "assert final_answer[\"query_id\"].is_unique\n",
+        "assert set(final_answer[\"query_id\"]) == set(queries[\"query_id\"])\n",
+        "\n",
+        "for ids in final_predictions:\n",
+        "    assert len(ids) == 50\n",
+        "    assert len(ids) == len(set(ids))\n",
+        "    assert set(ids) <= allowed_ids\n",
+        "\n",
+        "final_answer.to_csv(\n",
+        "    OUTPUT_DIR / \"answer.csv\",\n",
+        "    index=False,\n",
+        "    encoding=\"utf-8\",\n",
+        ")\n",
+        "\n",
+        "experiments.to_csv(\n",
+        "    OUTPUT_DIR / \"validation_experiments.csv\",\n",
+        "    index=False,\n",
+        ")\n",
+        "\n",
+        "print(\"Готово:\", OUTPUT_DIR / \"answer.csv\")"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2026-09-28T19:51:20.246861Z",
+          "iopub.execute_input": "2026-09-28T19:51:20.247486Z",
+          "iopub.status.idle": "2026-09-28T19:51:55.844865Z",
+          "shell.execute_reply.started": "2026-09-28T19:51:20.247455Z",
+          "shell.execute_reply": "2026-09-28T19:51:55.843993Z"
+        },
+        "id": "C0xJ8NCsnePk",
+        "outputId": "18ba9910-5c4e-41af-d79c-7001dc3997c8",
+        "colab": {
+          "referenced_widgets": [
+            "1ae2dd4698f2448a891846ee5b4d93ca"
+          ]
+        }
+      },
+      "outputs": [
+        {
+          "name": "stdout",
+          "text": "Готовим ответы улучшенного варианта.\n",
+          "output_type": "stream"
+        },
+        {
+          "output_type": "display_data",
+          "data": {
+            "text/plain": "  0%|          | 0/77 [00:00<?, ?it/s]",
+            "application/vnd.jupyter.widget-view+json": {
+              "version_major": 2,
+              "version_minor": 0,
+              "model_id": "1ae2dd4698f2448a891846ee5b4d93ca"
+            }
+          },
+          "metadata": {}
+        },
+        {
+          "name": "stdout",
+          "text": "Выбранные настройки:\nlocation_multiplier    16.000000\ncatboost_weight         0.500000\nRecall@50               0.782933\nName: 0, dtype: float64\nГотово: /kaggle/working/answer.csv\n",
+          "output_type": "stream"
+        }
+      ],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "final-summary"
+      },
+      "source": [
+        "### Итог\n",
+        "\n",
+        "На Stepik baseline получил 0,690, а итоговый вариант 0,738. Прирост составил 4,8 процентного пункта Recall@50.\n",
+        "\n",
+        "Файл для отправки: answer.csv. Дополнительно сохраняются answer_baseline.csv, модель catboost_retrieval.cbm и таблица validation_experiments.csv."
+      ]
+    }
+  ]
+}
